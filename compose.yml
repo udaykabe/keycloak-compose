@@ -1,3 +1,9 @@
+---
+# Logging modularization and re-use with compose extension
+# Must be a top-level element like 'services' below
+# This common logging configuration is anchored(&) by the alias
+# 'logging'.  To reuse this configuration, reference this alias
+# later in the compose file by using *logging
 x-logging: &logging
   driver: "json-file"
   options:
@@ -5,47 +11,58 @@ x-logging: &logging
     max-file: "3"
 
 services:
-  postgres:
-    image: postgres:${POSTGRES_VERSION}
+  postgres_kc:
+    image: postgres:16.6-alpine
     restart: unless-stopped
     healthcheck:
+      # pg_isready command runs inside the container
       test: ["CMD", "pg_isready", "-U", "keycloak"]
     environment:
       POSTGRES_DB: keycloak
-      POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: password
+      POSTGRES_USER: ${POSTGRES_USER:-keycloak}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eX4mP13p455w0Rd}
+    expose:
+      - "5432"  
     volumes:
       - type: tmpfs
         target: /var/lib/postgresql/data
         tmpfs:
-          size: 100000000
+          size: 100mb
+    networks:
+      - back-tier
     logging: *logging
 
+
   keycloak:
-    image: quay.io/keycloak/keycloak:${KC_VERSION}
+    image: quay.io/keycloak/keycloak:26.1.0
     command: ["start-dev", "--import-realm"]
     restart: unless-stopped
     environment:
       KC_DB: postgres
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: password
-      KC_DB_URL: "jdbc:postgresql://postgres:5432/keycloak"
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-eX4mP13p455w0Rd}
+      KC_DB_URL: "jdbc:postgresql://postgres_kc:5432/keycloak"
       KC_METRICS_ENABLED: true
       KC_LOG_LEVEL: ${KC_LOG_LEVEL}
       KC_REALM_NAME: ${KC_REALM_NAME}
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
-      GF_URL: ${GF_HOSTNAME}:${GF_SERVER_HTTP_PORT}
+      GF_URL: "http://localhost:3100" 
       GF_ADMIN_USERNAME: ${GF_ADMIN_USERNAME}
       GF_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD}
     ports:
       - ${KC_PORT}:8080
+      - 9000:9000
     volumes:
       - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+    depends_on:
+      - postgres_kc
+    networks:
+      - back-tier
     logging: *logging
 
   prometheus:
-    image: prom/prometheus:${PROMETHEUS_VERSION}
+    image: prom/prometheus:v3.1.0
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -54,23 +71,27 @@ services:
       - '--web.enable-lifecycle'
     restart: unless-stopped
     healthcheck:
+      # wget command runs inside the container so localhost refers to the container
       test: ["CMD", "wget", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
     ports:
-      - ${PROMETHEUS_PORT}:9090
+      - 9090:9090
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - back-tier
     logging: *logging
 
   grafana:
-    image: grafana/grafana-oss:${GF_VERSION}
+    image: grafana/grafana-oss:11.4.0
     restart: unless-stopped
     ports:
-      - ${GF_SERVER_HTTP_PORT}:${GF_SERVER_HTTP_PORT}
+      - '3100:3100'
     healthcheck:
-      test: ["CMD", "wget", "--spider", "http://localhost:${GF_SERVER_HTTP_PORT}/api/health"]
+      # wget command runs inside the container so localhost refers to the container
+      test: ["CMD", "wget", "--spider", "http://localhost:3100/api/health"]
     environment:
-      GF_SERVER_HTTP_PORT: ${GF_SERVER_HTTP_PORT}
-      GF_SERVER_ROOT_URL: ${GF_HOSTNAME}:${GF_SERVER_HTTP_PORT}
+      GF_SERVER_HTTP_PORT: 3100
+      GF_SERVER_ROOT_URL: "http://localhost:3100"
       GF_LOG_LEVEL: ${GF_LOG_LEVEL}
       GF_AUTH_BASIC_ENABLED: true
       GF_AUTH_DISABLE_LOGIN_FORM: true
@@ -82,9 +103,16 @@ services:
       GF_AUTH_GENERIC_OAUTH_EMAIL_ATTRIBUTE_NAME: "email:primary"
       GF_AUTH_GENERIC_OAUTH_SCOPES: "openid profile email"
       GF_AUTH_GENERIC_OAUTH_AUTH_URL: ${KC_HOSTNAME}:${KC_PORT}/realms/${KC_REALM_NAME}/protocol/openid-connect/auth
-      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: http://keycloak:${KC_PORT}/realms/${KC_REALM_NAME}/protocol/openid-connect/token
-      GF_AUTH_GENERIC_OAUTH_API_URL: ${KC_HOSTNAME}:${KC_PORT}/realms/${KC_REALM_NAME}/protocol/openid-connect/userinfo
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: http://keycloak:8080/realms/${KC_REALM_NAME}/protocol/openid-connect/token
+      # No need to configure below variable since userinfo is available in the ID token returned from the above token URL
+      #GF_AUTH_GENERIC_OAUTH_API_URL: http://keycloak:8080/realms/${KC_REALM_NAME}/protocol/openid-connect/userinfo
     volumes:
       - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - back-tier
     logging: *logging
+
+networks:
+  back-tier:
+    driver: bridge
